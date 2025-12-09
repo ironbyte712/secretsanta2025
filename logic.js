@@ -1,3 +1,4 @@
+// ...existing code...
 // Storage keys
 const KEY_PARTS = 'ss_participants';
 const KEY_ASSIGN = 'ss_assignments'; // giver -> {receiver,wishlist,address,code}
@@ -230,23 +231,126 @@ function clearAll(){
 function csvEscape(s){ return '"' + (s||'').replace(/"/g,'""') + '"'; }
 function escapeHtml(s){ if(!s) return ''; return String(s).replace(/[&<>"']/g, function (m) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); }); }
 
+// --- Firebase integration (Realtime DB + Auth) ---
+// Replace values in FIREBASE.firebaseConfig and FIREBASE.ADMIN_UID with your project values.
+const FIREBASE = {
+  firebaseConfig: {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+    databaseURL: "https://YOUR_PROJECT_ID.firebaseio.com",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_PROJECT_ID.appspot.com",
+    messagingSenderId: "SENDER_ID",
+    appId: "APP_ID"
+  },
+  ADMIN_UID: "YOUR_ADMIN_UID" // replace with admin user's UID from Firebase Authentication
+};
+
+function initFirebase(){
+  if(typeof firebase === 'undefined') return false;
+  if(!firebase.apps.length){
+    try { firebase.initializeApp(FIREBASE.firebaseConfig); } catch(e){ /* already init maybe */ }
+  }
+  window.fbDB = firebase.database();
+  window.fbAuth = firebase.auth();
+  // update admin pass hint based on auth state
+  fbAuth.onAuthStateChanged(u => {
+    const hint = document.getElementById('adminPassHint');
+    if(hint) hint.textContent = u ? 'signed-in (firebase)' : (localStorage.getItem(KEY_ADMINPASS) ? 'set' : 'not set');
+  });
+  return true;
+}
+
+// sign in admin (email/password) — call from console or add a small UI to call it
+async function signInAdminFirebase(email, password){
+  if(!window.fbAuth) return alert('Firebase not initialized');
+  try{
+    await fbAuth.signInWithEmailAndPassword(email, password);
+    alert('Signed in as admin (firebase). You may now save assignments remotely.');
+  }catch(err){
+    alert('Sign in failed: ' + err.message);
+  }
+}
+window.signInAdminFirebase = signInAdminFirebase;
+
+// save assignments to remote DB (only allowed to admin by DB rules)
+async function saveAssignmentsRemote(){
+  if(!window.fbDB) return alert('Remote DB not available');
+  const user = fbAuth.currentUser;
+  if(!user) return alert('Sign in as admin (firebase) to save assignments.');
+  if(user.uid !== FIREBASE.ADMIN_UID) return alert('Only the configured admin can save assignments.');
+  try{
+    await fbDB.ref('/secret-santa/2025/assignments').set(assignments);
+    alert('Assignments saved to remote DB.');
+  }catch(err){
+    alert('Save failed: ' + err.message);
+  }
+}
+window.saveAssignmentsRemote = saveAssignmentsRemote;
+
+// load assignments from remote DB (returns true if loaded)
+async function loadAssignmentsRemote(){
+  if(!window.fbDB) return false;
+  try{
+    const snap = await fbDB.ref('/secret-santa/2025/assignments').get();
+    if(snap.exists()){
+      assignments = snap.val();
+      saveJSON(KEY_ASSIGN, assignments); // cache locally
+      return true;
+    }
+  }catch(err){
+    console.warn('Remote load failed', err);
+  }
+  return false;
+}
+window.loadAssignmentsRemote = loadAssignmentsRemote;
+
+// Wrap existing generateAllAssignments to attempt remote save when admin signed in
+const _origGenerateAllAssignments = generateAllAssignments;
+generateAllAssignments = function(...args){
+  _origGenerateAllAssignments.apply(this, args);
+  // attempt remote save (don't block)
+  if(window.fbDB && window.fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+    saveAssignmentsRemote().catch(()=>{ /* ignore */ });
+  }
+};
+window.generateAllAssignments = generateAllAssignments;
+
+// Wrap revealByName to try remote load when local assignments missing
+const _origRevealByName = revealByName;
+revealByName = async function(...args){
+  assignments = loadJSON(KEY_ASSIGN) || assignments || {};
+  if(!assignments || Object.keys(assignments).length === 0){
+    // try remote
+    const ok = await loadAssignmentsRemote();
+    if(!ok){
+      alert("Assignments not generated yet locally or remotely. Contact admin.");
+      return;
+    }
+  }
+  return _origRevealByName.apply(this, args);
+};
+window.revealByName = revealByName;
+
 // expose functions used by inline onclick handlers
 window.adminLogin = adminLogin;
 window.setAdminPass = setAdminPass;
 window.parseExcel = parseExcel;
 window.addSingleParticipant = addSingleParticipant;
-window.generateAllAssignments = generateAllAssignments;
 window.downloadCodesCSV = downloadCodesCSV;
-window.revealByName = revealByName;
 window.clearAll = clearAll;
 
 // init UI state
 (function init(){
+    // initialize firebase (if SDK scripts present in index.html)
+    initFirebase();
+
     participants = loadJSON(KEY_PARTS) || [];
     assignments = loadJSON(KEY_ASSIGN) || {};
     usedGivers = loadJSON(KEY_USED) || [];
     if(participants.length) refreshAdminList();
     if(Object.keys(assignments).length) document.getElementById('revealResult').innerHTML = '<div class="hint">Assignments exist. Enter your name & secret code to reveal your match (one attempt).</div>';
     const pass = localStorage.getItem(KEY_ADMINPASS) || 'admin123';
-    document.getElementById('adminPassHint').textContent = pass ? 'set' : 'not set';
+    const hintEl = document.getElementById('adminPassHint');
+    if(hintEl) hintEl.textContent = pass ? 'set' : 'not set';
 })();

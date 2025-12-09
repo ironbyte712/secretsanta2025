@@ -15,7 +15,6 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<!-- ...existing code... -->
 
 <main class="container">
   <header class="my-4">
@@ -55,6 +54,19 @@
         <button onclick="setAdminPass()" class="btn btn-secondary">Save password</button>
       </div>
       <div class="small mt-1"> (current: <span id="adminPassHint">not set</span>)</div>
+    </div>
+
+    <hr/>
+
+    <div class="mb-3">
+      <label class="form-label">Firebase Admin Login (for syncing across machines):</label>
+      <div class="d-flex gap-2 flex-wrap">
+        <input id="adminEmail" type="email" class="form-control" placeholder="admin email" style="flex: 1; min-width: 200px;"/>
+        <input id="adminFirebasePass" type="password" class="form-control" placeholder="admin password" style="flex: 1; min-width: 200px;"/>
+        <button onclick="signInAdminFirebase(document.getElementById('adminEmail').value, document.getElementById('adminFirebasePass').value)" class="btn btn-success">Sign In (Firebase)</button>
+        <button onclick="signOutAdminFirebase()" class="btn btn-warning">Sign Out</button>
+      </div>
+      <div class="small mt-1">Sign in with your Firebase Auth account to enable real-time sync.</div>
     </div>
 
     <hr/>

@@ -1,36 +1,93 @@
-// full client-side logic with Firebase Realtime DB integration (compat)
-//////////////////////////////////////////////////////////////
-// Replace FIREBASE.firebaseConfig values with your project's
-// config and ensure FIREBASE.ADMIN_UID matches the admin user UID
-//////////////////////////////////////////////////////////////
+// client-side logic with robust Firebase initialization + realtime DB sync
 
 // Storage keys
 const KEY_PARTS = 'ss_participants';
-const KEY_ASSIGN = 'ss_assignments'; // giver -> {receiver,wishlist,address,code}
-const KEY_USED = 'ss_used'; // array of givers who already revealed
+const KEY_ASSIGN = 'ss_assignments';
+const KEY_USED = 'ss_used';
 const KEY_ADMINPASS = 'ss_admin_pass';
 
 // In-memory
-let participants = loadJSON(KEY_PARTS) || []; // {name,wishlist,address}
-let assignments = loadJSON(KEY_ASSIGN) || {}; // giver -> {receiver,wishlist,address,code}
-let usedGivers = loadJSON(KEY_USED) || []; // array of names
+let participants = loadJSON(KEY_PARTS) || [];
+let assignments = loadJSON(KEY_ASSIGN) || {};
+let usedGivers = loadJSON(KEY_USED) || [];
 
 // Utility
 function saveJSON(key, obj){ localStorage.setItem(key, JSON.stringify(obj)); }
 function loadJSON(key){ try { return JSON.parse(localStorage.getItem(key)); } catch(e){ return null; } }
 
+// Helpers
+function csvEscape(s){ return '"' + (s||'').replace(/"/g,'""') + '"'; }
+function escapeHtml(s){ if(!s) return ''; return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function encodeKey(s){ return encodeURIComponent(s).replace(/\./g, '%2E'); }
+
+// ---------------- Firebase config (replace with your project values) ----------------
+const FIREBASE = {
+  firebaseConfig: {
+    apiKey: "AIzaSyDdbYqKXdqXLcBM_jMvNFynixDCEPHAueA",
+    authDomain: "secret-santa-2025-ffd0f.firebaseapp.com",
+    databaseURL: "https://secret-santa-2025-ffd0f-default-rtdb.firebaseio.com",
+    projectId: "secret-santa-2025-ffd0f",
+    storageBucket: "secret-santa-2025-ffd0f.firebasestorage.app",
+    messagingSenderId: "343121297338",
+    appId: "1:343121297338:web:1b35b6e2ae99fad7202783",
+    measurementId: "G-TGPGVE6D76"
+  },
+  ADMIN_UID: "yzPF4T8R6XeAv7XpXbku4qOliCu1" // replace with your admin UID
+};
+
+let fbDB = null;
+let fbAuth = null;
+
+// Wait for firebase SDK to be available (in case script load order/latency)
+function waitForFirebaseSDK(timeout = 5000){
+  return new Promise((resolve, reject) => {
+    if(typeof window.firebase !== 'undefined') return resolve();
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if(typeof window.firebase !== 'undefined'){
+        clearInterval(iv);
+        return resolve();
+      }
+      if(Date.now() - start > timeout){
+        clearInterval(iv);
+        return reject(new Error('Firebase SDK not loaded.'));
+      }
+    }, 100);
+  });
+}
+
+// Initialize Firebase app + services
+function initFirebase(){
+  if(typeof firebase === 'undefined') return false;
+  try {
+    if(!firebase.apps.length) firebase.initializeApp(FIREBASE.firebaseConfig);
+  } catch(e){ /* ignore if already initialized */ }
+  fbDB = firebase.database();
+  fbAuth = firebase.auth();
+  fbAuth.onAuthStateChanged(u => {
+    const hint = document.getElementById('adminPassHint');
+    if(hint) hint.textContent = u ? 'signed-in (firebase)' : (localStorage.getItem(KEY_ADMINPASS) ? 'set' : 'not set');
+    const signedEl = document.getElementById('adminSignedIn');
+    if(signedEl) signedEl.textContent = u ? (u.email || u.uid) : 'not signed in';
+    if(u && u.uid === FIREBASE.ADMIN_UID){
+      const panel = document.getElementById('adminPanel');
+      if(panel) panel.style.display = 'block';
+      refreshAdminList();
+    }
+  });
+  setupRealtimeListeners();
+  return true;
+}
+
 // ---------------- Admin / local auth ----------------
 function adminLogin(){
-  // If Firebase signed-in as admin -> show console
-  if(window.fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+  if(fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
     document.getElementById('adminPanel').style.display = 'block';
     refreshAdminList();
     return;
   }
-
-  // fallback: local password prompt (existing behavior)
-  const stored = localStorage.getItem(KEY_ADMINPASS) || 'admin123';
-  const p = prompt("Enter admin password (or leave blank to sign-in with Firebase):");
+  const stored = localStorage.getItem(KEY_ADMINPASS) || '';
+  const p = prompt("Enter admin password (leave blank to sign-in with Firebase):");
   if(p === null) return;
   if(p === ''){
     const email = prompt('Admin email (Firebase):');
@@ -47,7 +104,7 @@ function adminLogin(){
   }
   if(p === stored){
     document.getElementById('adminPanel').style.display = 'block';
-    document.getElementById('adminPassHint').textContent = 'set';
+    document.getElementById('adminPassHint').textContent = stored ? 'set' : 'not set';
     refreshAdminList();
     return;
   }
@@ -57,11 +114,15 @@ function setAdminPass(){
   const v = document.getElementById('adminPass').value;
   if(!v){ alert("Leave blank to keep existing password."); return; }
   localStorage.setItem(KEY_ADMINPASS, v);
-  alert("Password saved.");
+  alert("Password saved locally.");
   document.getElementById('adminPass').value = '';
+  // store a marker in DB (do not store plaintext). requires admin auth.
+  if(fbDB && fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+    fbDB.ref('/secret-santa/2025/adminPassword').set({ setAt: Date.now(), by: fbAuth.currentUser.uid }).catch(()=>{});
+  }
 }
 
-// ---------------- Excel parsing (SheetJS) ----------------
+// ---------------- Excel parsing ----------------
 function parseExcel(){
   const f = document.getElementById('excelInput').files[0];
   if(!f){ alert("Choose an Excel/CSV file first."); return; }
@@ -90,32 +151,27 @@ function parseExcel(){
     });
     saveJSON(KEY_PARTS, participants);
     refreshAdminList();
-    // try to save remote if admin signed in
-    if(window.fbDB && window.fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
-      saveParticipantsRemote().catch(()=>{/* ignore */});
+    if(fbDB && fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+      saveParticipantsRemote().catch(()=>{});
     }
     alert("Loaded " + mapped.length + " participants.");
   };
   reader.readAsBinaryString(f);
 }
 
-// ---------------- single participant ----------------
 function addSingleParticipant(){
   const n = document.getElementById('singleName').value.trim();
   if(!n){ alert("Enter a name."); return; }
   if(participants.some(p => p.name === n)){ alert("Name already exists."); return; }
   participants.push({name: n, wishlist: document.getElementById('singleWishlist').value.trim(), address: document.getElementById('singleAddress').value.trim()});
   saveJSON(KEY_PARTS, participants);
-  document.getElementById('singleName').value='';
-  document.getElementById('singleWishlist').value='';
-  document.getElementById('singleAddress').value='';
+  document.getElementById('singleName').value=''; document.getElementById('singleWishlist').value=''; document.getElementById('singleAddress').value='';
   refreshAdminList();
-  if(window.fbDB && window.fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
-    saveParticipantsRemote().catch(()=>{/* ignore */});
+  if(fbDB && fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+    saveParticipantsRemote().catch(()=>{});
   }
 }
 
-// ---------------- UI admin list (names only) ----------------
 function refreshAdminList(){
   const el = document.getElementById('adminList');
   if(!el) return;
@@ -128,18 +184,8 @@ function refreshAdminList(){
 
 // ---------------- derangement & codes ----------------
 function shuffleArray(a){ const arr = a.slice(); for(let i=arr.length-1;i>0;i--){ const j = Math.floor(Math.random()*(i+1)); [arr[i],arr[j]] = [arr[j],arr[i]] } return arr; }
-function makeDerangement(names){
-  if(names.length < 2) return null;
-  let attempts = 0, receivers;
-  do { receivers = shuffleArray(names); attempts++; if(attempts > 5000) return null; } while(names.some((n,i)=>n===receivers[i]));
-  return receivers;
-}
-function genCode(len){
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let s = ''; const array = new Uint8Array(len); window.crypto.getRandomValues(array);
-  for(let i=0;i<len;i++) s += chars[array[i] % chars.length];
-  return s;
-}
+function makeDerangement(names){ if(names.length < 2) return null; let attempts = 0, receivers; do { receivers = shuffleArray(names); attempts++; if(attempts > 5000) return null; } while(names.some((n,i)=>n===receivers[i])); return receivers; }
+function genCode(len){ const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; let s = ''; const array = new Uint8Array(len); window.crypto.getRandomValues(array); for(let i=0;i<len;i++) s += chars[array[i] % chars.length]; return s; }
 
 function generateAllAssignments(){
   if(participants.length < 2){ alert("Need at least 2 participants."); return; }
@@ -159,11 +205,9 @@ function generateAllAssignments(){
     };
   }
   saveJSON(KEY_ASSIGN, assignments);
-  // reset used
   usedGivers = []; saveJSON(KEY_USED, usedGivers);
-  // try saving remote assignments if admin signed in
-  if(window.fbDB && window.fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
-    saveAssignmentsRemote().catch(()=>{/* ignore */});
+  if(fbDB && fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+    saveAssignmentsRemote().catch(()=>{});
   }
   alert("Assignments + secret codes generated. Download codes CSV and distribute privately.");
 }
@@ -176,8 +220,7 @@ function downloadCodesCSV(){
   const csv = lines.join('\n');
   const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = 'secret_santa_codes.csv'; document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+  const a = document.createElement('a'); a.href = url; a.download = 'secret_santa_codes.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 }
 
 // ---------------- reveal flow ----------------
@@ -191,7 +234,14 @@ function revealByName(){
   usedGivers = loadJSON(KEY_USED) || usedGivers || [];
 
   if(!assignments || Object.keys(assignments).length === 0){
-    alert("Assignments not generated yet. Contact admin.");
+    // try remote fallback
+    if(fbDB) {
+      loadAssignmentsRemote().then(ok => {
+        if(ok) revealByName(); else alert("Assignments not generated yet. Contact admin.");
+      });
+    } else {
+      alert("Assignments not generated yet. Contact admin.");
+    }
     return;
   }
   const entry = assignments[name];
@@ -202,13 +252,11 @@ function revealByName(){
   const html = `<strong>${escapeHtml(name)} → ${escapeHtml(entry.receiver)}</strong><br/>
                 <div class="small"><strong>Wishlist:</strong> ${escapeHtml(entry.wishlist || '(none)')}</div>
                 <div class="small"><strong>Address:</strong> ${escapeHtml(entry.address || '(none)')}</div>`;
-  document.getElementById('revealResult').innerHTML = html;
+  const rr = document.getElementById('revealResult'); if(rr) rr.innerHTML = html;
 
-  // mark used locally and remote (if allowed)
   usedGivers.push(name); saveJSON(KEY_USED, usedGivers);
-  if(window.fbDB && window.fbAuth && fbAuth.currentUser){
-    // write under usedGivers/<name> = timestamp (requires DB rule allowing authenticated writes)
-    try { fbDB.ref(`/secret-santa/2025/usedGivers/${encodeKey(name)}`).set({by: fbAuth.currentUser.uid || 'anon', at: Date.now()}); } catch(e){/* ignore */ }
+  if(fbDB && fbAuth && fbAuth.currentUser){
+    fbDB.ref(`/secret-santa/2025/usedGivers/${encodeKey(name)}`).set({ by: fbAuth.currentUser.uid || 'anon', at: Date.now() }).catch(()=>{});
   }
 }
 
@@ -219,118 +267,60 @@ function clearAll(){
   participants = []; assignments = {}; usedGivers = [];
   refreshAdminList();
   const res = document.getElementById('revealResult'); if(res) res.innerHTML = '';
+  if(fbDB && fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+    fbDB.ref('/secret-santa/2025/participants').remove().catch(()=>{});
+    fbDB.ref('/secret-santa/2025/assignments').remove().catch(()=>{});
+    fbDB.ref('/secret-santa/2025/usedGivers').remove().catch(()=>{});
+  }
   alert("Cleared.");
 }
 
-// ---------------- helpers ----------------
-function csvEscape(s){ return '"' + (s||'').replace(/"/g,'""') + '"'; }
-function escapeHtml(s){ if(!s) return ''; return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-function encodeKey(s){ return encodeURIComponent(s).replace(/\./g, '%2E'); }
-
-// ---------------- Firebase integration (compat libs required in index.html) ----------------
-const FIREBASE = {
-  firebaseConfig: {
-    apiKey: "AIzaSyDdbYqKXdqXLcBM_jMvNFynixDCEPHAueA",
-  authDomain: "secret-santa-2025-ffd0f.firebaseapp.com",
-  databaseURL: "https://secret-santa-2025-ffd0f-default-rtdb.firebaseio.com",
-  projectId: "secret-santa-2025-ffd0f",
-  storageBucket: "secret-santa-2025-ffd0f.firebasestorage.app",
-  messagingSenderId: "343121297338",
-  appId: "1:343121297338:web:1b35b6e2ae99fad7202783",
-  measurementId: "G-TGPGVE6D76"
-  },
-  ADMIN_UID: "AIJN0S3zihSP6ueVWMJQuEpfLnu1" // replace if different
-};
-
-function initFirebase(){
-  if(typeof firebase === 'undefined') return false;
-  if(!firebase.apps.length){
-    try { firebase.initializeApp(FIREBASE.firebaseConfig); } catch(e){ /* already init or error */ }
-  }
-  window.fbDB = firebase.database();
-  window.fbAuth = firebase.auth();
-  // update hint on auth changes
-  fbAuth.onAuthStateChanged(u => {
-    const hint = document.getElementById('adminPassHint');
-    if(hint) hint.textContent = u ? 'signed-in (firebase)' : (localStorage.getItem(KEY_ADMINPASS) ? 'set' : 'not set');
-  });
-  // setup realtime syncing listeners
-  setupRealtimeListeners();
-  return true;
-}
-
-// sign-in helper for admin (email/password)
-async function signInAdminFirebase(email, password){
-  if(!window.fbAuth) return alert('Firebase not initialized');
-  try{
-    await fbAuth.signInWithEmailAndPassword(email, password);
-    alert('Signed in as admin (firebase).');
-  }catch(err){
-    alert('Sign in failed: ' + err.message);
-  }
-}
-window.signInAdminFirebase = signInAdminFirebase;
-
-// save participants (admin only)
+// ---------------- Firebase remote helpers ----------------
 async function saveParticipantsRemote(){
-  if(!window.fbDB) return;
-  const user = fbAuth.currentUser; if(!user) return alert('Sign in as admin (firebase) to save participants.');
-  if(user.uid !== FIREBASE.ADMIN_UID) return alert('Only admin can save participants remotely.');
+  if(!fbDB || !fbAuth || !fbAuth.currentUser) return;
+  if(fbAuth.currentUser.uid !== FIREBASE.ADMIN_UID) return alert('Only admin can save participants remotely.');
   try{
     await fbDB.ref('/secret-santa/2025/participants').set(participants);
-    await fbDB.ref('/secret-santa/2025/meta/lastUpdated').set({by: user.uid, at: Date.now()});
-  }catch(err){ console.warn('saveParticipantsRemote failed', err); }
+    await fbDB.ref('/secret-santa/2025/meta/lastUpdated').set({by: fbAuth.currentUser.uid, at: Date.now()});
+  }catch(e){ console.warn(e); alert('Remote save failed: ' + e.message); }
 }
-window.saveParticipantsRemote = saveParticipantsRemote;
-
-// save assignments (admin only)
 async function saveAssignmentsRemote(){
-  if(!window.fbDB) return;
-  const user = fbAuth.currentUser; if(!user) return alert('Sign in as admin (firebase) to save assignments.');
-  if(user.uid !== FIREBASE.ADMIN_UID) return alert('Only admin can save assignments remotely.');
+  if(!fbDB || !fbAuth || !fbAuth.currentUser) return;
+  if(fbAuth.currentUser.uid !== FIREBASE.ADMIN_UID) return alert('Only admin can save assignments remotely.');
   try{
     await fbDB.ref('/secret-santa/2025/assignments').set(assignments);
-    await fbDB.ref('/secret-santa/2025/meta/assignmentsUpdated').set({by: user.uid, at: Date.now()});
-  }catch(err){ console.warn('saveAssignmentsRemote failed', err); }
+    await fbDB.ref('/secret-santa/2025/meta/assignmentsUpdated').set({by: fbAuth.currentUser.uid, at: Date.now()});
+  }catch(e){ console.warn(e); alert('Remote save failed: ' + e.message); }
 }
-window.saveAssignmentsRemote = saveAssignmentsRemote;
-
-// load participants once (fallback)
 async function loadParticipantsRemote(){
-  if(!window.fbDB) return false;
+  if(!fbDB) return false;
   try{
-    const snap = await fbDB.ref('/secret-santa/2025/participants').once('value');
+    const snap = await fbDB.ref('/secret-santa/2025/participants').get();
     if(snap.exists()){
       participants = snap.val() || [];
       saveJSON(KEY_PARTS, participants);
       refreshAdminList();
       return true;
     }
-  }catch(err){ console.warn('loadParticipantsRemote failed', err); }
+  }catch(e){ console.warn(e); }
   return false;
 }
-window.loadParticipantsRemote = loadParticipantsRemote;
-
-// load assignments once (fallback)
 async function loadAssignmentsRemote(){
-  if(!window.fbDB) return false;
+  if(!fbDB) return false;
   try{
-    const snap = await fbDB.ref('/secret-santa/2025/assignments').once('value');
+    const snap = await fbDB.ref('/secret-santa/2025/assignments').get();
     if(snap.exists()){
       assignments = snap.val() || {};
       saveJSON(KEY_ASSIGN, assignments);
       return true;
     }
-  }catch(err){ console.warn('loadAssignmentsRemote failed', err); }
+  }catch(e){ console.warn(e); }
   return false;
 }
-window.loadAssignmentsRemote = loadAssignmentsRemote;
 
-// realtime listeners - keep local state in sync when remote changes
 function setupRealtimeListeners(){
-  if(!window.fbDB) return;
-  const partsRef = fbDB.ref('/secret-santa/2025/participants');
-  partsRef.on('value', snap => {
+  if(!fbDB) return;
+  fbDB.ref('/secret-santa/2025/participants').on('value', snap => {
     const val = snap.val();
     if(val){
       participants = val;
@@ -338,8 +328,7 @@ function setupRealtimeListeners(){
       refreshAdminList();
     }
   });
-  const assignRef = fbDB.ref('/secret-santa/2025/assignments');
-  assignRef.on('value', snap => {
+  fbDB.ref('/secret-santa/2025/assignments').on('value', snap => {
     const val = snap.val();
     if(val){
       assignments = val;
@@ -348,7 +337,63 @@ function setupRealtimeListeners(){
   });
 }
 
-// ---------------- wire up UI functions for inline handlers ----------------
+// ---------------- auth UI helpers ----------------
+async function signInAdminFirebase(email, password){
+  if(!fbAuth) return alert('Firebase not initialized');
+  try{ await fbAuth.signInWithEmailAndPassword(email, password); alert('Signed in via Firebase'); }
+  catch(err){ alert('Sign in failed: ' + err.message); }
+}
+async function signInAdminUI(){
+  const email = document.getElementById('adminEmail').value.trim();
+  const pw = document.getElementById('adminPw').value;
+  if(!email || !pw) return alert('Enter email and password.');
+  await signInAdminFirebase(email, pw);
+  document.getElementById('adminPw').value = '';
+  if(fbAuth && fbAuth.currentUser && fbAuth.currentUser.uid === FIREBASE.ADMIN_UID){
+    document.getElementById('adminPanel').style.display = 'block';
+    refreshAdminList();
+    alert('Signed in as admin.');
+  } else {
+    alert('Signed in (not configured admin).');
+  }
+}
+async function signOutAdmin(){
+  if(fbAuth && fbAuth.currentUser){
+    try{ await fbAuth.signOut(); }catch(e){ console.warn(e); }
+  }
+  document.getElementById('adminPanel').style.display = 'none';
+  const hint = document.getElementById('adminPassHint');
+  if(hint) hint.textContent = localStorage.getItem(KEY_ADMINPASS) ? 'set' : 'not set';
+  const signedIn = document.getElementById('adminSignedIn');
+  if(signedIn) signedIn.textContent = 'not signed in';
+  alert('Signed out.');
+}
+
+// ---------------- init (wait for SDK, then init Firebase) ----------------
+(async function init(){
+  try {
+    await waitForFirebaseSDK(5000);
+    initFirebase();
+  } catch(err) {
+    console.error('Firebase SDK load failed:', err);
+    // keep app working locally; show helpful message
+    alert('Firebase not initialized. Remote sync disabled. Check console for details.');
+  }
+
+  participants = loadJSON(KEY_PARTS) || [];
+  assignments = loadJSON(KEY_ASSIGN) || {};
+  usedGivers = loadJSON(KEY_USED) || [];
+  if(participants.length) refreshAdminList();
+  if(Object.keys(assignments).length){
+    const rr = document.getElementById('revealResult');
+    if(rr) rr.innerHTML = '<div class="hint">Assignments exist. Enter your name & secret code to reveal your match (one attempt).</div>';
+  }
+  const pass = localStorage.getItem(KEY_ADMINPASS) || '';
+  const hintEl = document.getElementById('adminPassHint');
+  if(hintEl) hintEl.textContent = pass ? 'set' : 'not set';
+})();
+
+// expose functions for inline handlers
 window.adminLogin = adminLogin;
 window.setAdminPass = setAdminPass;
 window.parseExcel = parseExcel;
@@ -357,20 +402,5 @@ window.generateAllAssignments = generateAllAssignments;
 window.downloadCodesCSV = downloadCodesCSV;
 window.clearAll = clearAll;
 window.revealByName = revealByName;
-window.downloadCodesCSV = downloadCodesCSV;
-
-// ---------------- init ----------------
-(function init(){
-  initFirebase();
-  participants = loadJSON(KEY_PARTS) || [];
-  assignments = loadJSON(KEY_ASSIGN) || {};
-  usedGivers = loadJSON(KEY_USED) || [];
-  if(participants.length) refreshAdminList();
-  if(Object.keys(assignments).length) {
-    const rr = document.getElementById('revealResult');
-    if(rr) rr.innerHTML = '<div class="hint">Assignments exist. Enter your name & secret code to reveal your match (one attempt).</div>';
-  }
-  const pass = localStorage.getItem(KEY_ADMINPASS) || 'admin123';
-  const hintEl = document.getElementById('adminPassHint');
-  if(hintEl) hintEl.textContent = pass ? 'set' : 'not set';
-})();
+window.signInAdminUI = signInAdminUI;
+window.signOutAdmin = signOutAdmin;
